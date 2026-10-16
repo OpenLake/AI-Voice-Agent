@@ -34,8 +34,12 @@ from prompts import build_prompt
 from tools import AppointmentTools
 
 load_dotenv(".env")
-logging.basicConfig(level=logging.INFO)
+# No basicConfig: the LiveKit CLI installs its own handler, and a second one printed every line twice.
 logger = logging.getLogger("outbound-agent")
+logger.setLevel(logging.INFO)
+# Third-party wire-level chatter (hpack even dumps the Supabase key in headers) — keep warnings only.
+for _noisy in ("hpack", "h2", "httpx", "httpcore", "twilio", "urllib3", "asyncio", "websockets", "google_genai"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 SIP_DOMAIN = os.getenv("VOBIZ_SIP_DOMAIN", "")
 
@@ -220,12 +224,19 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             tools_override = data.get("tools_override")
         except (json.JSONDecodeError, AttributeError):
             await _log("warning", "Invalid JSON in job metadata")
+    else:
+        # Console / playground (no dial job): real demo identity so the model doesn't invent one.
+        lead_name     = os.getenv("DEMO_LEAD_NAME") or lead_name
+        business_name = os.getenv("DEMO_BUSINESS_NAME") or business_name
+        service_type  = os.getenv("DEMO_SERVICE_TYPE") or service_type
 
     await _log("info", f"Call job received — phone={phone_number} lead={lead_name} biz={business_name}")
 
     system_prompt = build_prompt(lead_name=lead_name, business_name=business_name,
                                   service_type=service_type, custom_prompt=custom_prompt)
-    tool_ctx = AppointmentTools(ctx, phone_number, lead_name)
+    # Tools get DEMO_PHONE in console mode so CRM/booking rows have a real number; dialing below
+    # still uses phone_number only, so this never places a call.
+    tool_ctx = AppointmentTools(ctx, phone_number or os.getenv("DEMO_PHONE") or None, lead_name)
 
     if voice_override:
         os.environ["GEMINI_TTS_VOICE"] = voice_override
@@ -263,7 +274,35 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 )
             )
         except Exception as exc:
+            # Classify the carrier's SIP response so the dashboard shows WHY the
+            # dial failed instead of a generic error. A 486/603 (or a 429
+            # resource_exhausted wrapper) means the TRUNK rejected the INVITE —
+            # busy / no free channel / rate-limited / blocked destination — it is
+            # NOT a bug in this code, and retrying immediately only worsens a 429.
+            _msg = str(exc)
+            if "486" in _msg or "Busy Here" in _msg:
+                _outcome, _reason = "busy", "carrier 486 Busy Here — trunk busy / no free channel / DND"
+            elif "resource_exhausted" in _msg or "429" in _msg:
+                _outcome, _reason = "rate_limited", "trunk/LiveKit concurrency or rate limit (429 resource_exhausted)"
+            elif "603" in _msg or "Decline" in _msg or "403" in _msg:
+                _outcome, _reason = "rejected", "carrier declined the call (destination/CLI not permitted)"
+            else:
+                _outcome, _reason = "dial_failed", f"SIP dial error: {_msg[:300]}"
             await _log("error", f"SIP dial FAILED for {phone_number}: {exc}")
+            # Record the failed attempt so it appears in Stats/CRM — otherwise a
+            # call that never connects vanishes (no call_log row is ever written).
+            try:
+                from db import log_call
+                await log_call(phone_number=phone_number, lead_name=lead_name,
+                               outcome=_outcome, reason=_reason, duration_seconds=0)
+            except Exception as _le:
+                logger.warning("could not log failed dial: %s", _le)
+            # Drop the now-useless room immediately instead of letting it linger
+            # for empty_timeout (300s) and tie up project resources.
+            try:
+                await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
+            except Exception:
+                pass
             ctx.shutdown()
             return
         await _log("info", f"Call ANSWERED — {phone_number} picked up, starting AI session now")
@@ -303,6 +342,19 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             tool_ctx.usage.add(getattr(ev, "metrics", ev))
         except Exception as _mx:
             logger.warning("usage metrics fold failed: %s", _mx)
+
+    # Live transcript + tool calls in the worker terminal.
+    @session.on("conversation_item_added")
+    def _on_item(ev) -> None:
+        text = getattr(ev.item, "text_content", None)
+        if text:
+            who = "🤖 AGENT" if ev.item.role == "assistant" else "👤 LEAD "
+            print(f"\n{who}: {text}", flush=True)
+
+    @session.on("function_tools_executed")
+    def _on_tools(ev) -> None:
+        for call, out in zip(ev.function_calls, ev.function_call_outputs):
+            print(f"\n🔧 TOOL {call.name}({call.arguments}) → {getattr(out, 'output', out)}", flush=True)
 
     await session.start(**_session_kwargs)
     await _log("info", "Agent session started — AI ready, generating greeting")
@@ -385,7 +437,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         # carrier never sends a clean hangup, force-terminate at MAX_CALL_SECONDS
         # so we never sit on a 1-hour open line recording dead air and burning
         # Gemini + Vobiz + LiveKit minutes. Default 300s (5 min); tune via env.
-        _max_call_seconds = int(os.getenv("MAX_CALL_SECONDS", "300"))
+        _max_call_seconds = int(os.getenv("MAX_CALL_SECONDS") or 300)  # `or`: empty value in .env → default
         _hit_cap = False
         try:
             await asyncio.wait_for(_disconnect_event.wait(), timeout=_max_call_seconds)

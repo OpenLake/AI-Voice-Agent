@@ -21,7 +21,7 @@ echo "   Trunk:    ${OUTBOUND_TRUNK_ID}"
 (
   while true; do
     echo "🤖 [worker] Starting LiveKit agent worker (outbound-caller)..."
-    python agent.py start || echo "🤖 [worker] exited (code $?) — restarting in 5s"
+    python3 agent.py start || echo "🤖 [worker] exited (code $?) — restarting in 5s"
     sleep 5
   done
 ) &

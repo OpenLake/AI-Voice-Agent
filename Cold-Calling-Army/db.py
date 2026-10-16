@@ -139,10 +139,14 @@ async def save_settings(data: dict) -> None:
 
 
 async def get_setting(key: str, default: str = "") -> str:
-    db = await _adb()
-    result = await db.table("settings").select("value").eq("key", key).maybe_single().execute()
-    if result and result.data:
-        return result.data["value"]
+    # A DB outage must not kill a call — fall back to the .env value.
+    try:
+        db = await _adb()
+        result = await db.table("settings").select("value").eq("key", key).maybe_single().execute()
+        if result and result.data:
+            return result.data["value"]
+    except Exception as exc:
+        print(f"⚠️  get_setting({key}) failed, using env default: {exc}")
     return _default(key) or default
 
 
