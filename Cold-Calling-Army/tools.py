@@ -196,6 +196,8 @@ class AppointmentTools(llm.ToolContext):
         phone: the lead's phone number with country code
         Returns call history, appointments, and remembered details.
         """
+        # The model doesn't know the dialled number and invents one — trust the call's number.
+        phone = self.phone_number or phone
         await _log("TOOL lookup_contact called", f"phone={phone}")
         try:
             calls = await get_calls_by_phone(phone)
